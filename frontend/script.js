@@ -38,43 +38,84 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- Configuration Management (A/B Testing) ---
-    const configurations = {
-        'c1': {
-            id: 'c1',
-            name: 'Configuration 1',
-            vision_model: 'qwen2.5-vl',
-            speech_model: 'faster-whisper-base',
-            embedding_model: 'all-minilm-l6-v2',
-            enable_vision: true
-        },
-        'c2': {
-            id: 'c2',
-            name: 'Configuration 2',
-            vision_model: 'blip-image-captioning-large',
-            speech_model: 'faster-whisper-large',
-            embedding_model: 'nomic-embed',
-            enable_vision: true
-        },
-        'c3': {
-            id: 'c3',
-            name: 'Configuration 3',
-            vision_model: 'florence-2-large',
-            speech_model: 'distil-whisper',
-            embedding_model: 'bge-m3',
-            enable_vision: false
-        }
-    };
-
+    // Configurations are loaded from the backend API for persistence
+    let configurations = {};  // Will be populated from API
     let currentConfigId = 'c1';
     const configSelect = document.getElementById('configSelect');
     const configSummary = document.getElementById('configSummary');
     const editConfigBtn = document.getElementById('editConfigBtn');
     const addConfigBtn = document.getElementById('addConfigBtn');
 
-    function initConfigUI() {
-        if (!configSelect) return;
+    // Load configurations from backend API
+    async function loadConfigurations() {
+        try {
+            const response = await fetch('/configs');
+            if (response.ok) {
+                const data = await response.json();
+                configurations = {};
+                data.configurations.forEach(config => {
+                    configurations[config.id] = config;
+                });
+                addLog(`Loaded ${data.configurations.length} configurations from server.`);
+                
+                // Set current config to first available if current doesn't exist
+                if (!configurations[currentConfigId] && Object.keys(configurations).length > 0) {
+                    currentConfigId = Object.keys(configurations)[0];
+                }
+                
+                populateConfigDropdown();
+            } else {
+                addLog('Failed to load configurations from server, using defaults.');
+                useDefaultConfigurations();
+            }
+        } catch (error) {
+            console.error('Error loading configurations:', error);
+            addLog('Error loading configurations, using defaults.');
+            useDefaultConfigurations();
+        }
+    }
 
-        // Populate Dropdown
+    function useDefaultConfigurations() {
+        configurations = {
+            'c1': {
+                id: 'c1',
+                name: 'BLIP + Whisper Base (Fast)',
+                vision_model: 'Salesforce/blip-image-captioning-base',
+                speech_model: 'base',
+                enable_vision: true,
+                frame_interval: 5
+            },
+            'c2': {
+                id: 'c2',
+                name: 'BLIP + Whisper Large',
+                vision_model: 'Salesforce/blip-image-captioning-base',
+                speech_model: 'large-v3',
+                enable_vision: true,
+                frame_interval: 5
+            },
+            'c3': {
+                id: 'c3',
+                name: 'Florence-2 + Distil-Whisper',
+                vision_model: 'microsoft/Florence-2-large',
+                speech_model: 'distil-large-v3',
+                enable_vision: true,
+                frame_interval: 5
+            },
+            'c4': {
+                id: 'c4',
+                name: 'Qwen VL + Whisper Base',
+                vision_model: 'Qwen/Qwen2.5-VL-7B-Instruct',
+                speech_model: 'base',
+                enable_vision: true,
+                frame_interval: 5
+            }
+        };
+        populateConfigDropdown();
+    }
+
+    function populateConfigDropdown() {
+        if (!configSelect) return;
+        
         configSelect.innerHTML = '';
         Object.values(configurations).forEach(config => {
             const option = document.createElement('option');
@@ -83,8 +124,15 @@ document.addEventListener('DOMContentLoaded', () => {
             if (config.id === currentConfigId) option.selected = true;
             configSelect.appendChild(option);
         });
-
+        
         updateConfigSummary();
+    }
+
+    function initConfigUI() {
+        if (!configSelect) return;
+
+        // Load configurations from API first
+        loadConfigurations();
 
         // Event Listeners
         configSelect.addEventListener('change', (e) => {
@@ -104,15 +152,64 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (addConfigBtn) {
             addConfigBtn.addEventListener('click', () => {
-                alert("Create New Configuration feature coming soon!");
+                openNewConfigModal();
             });
         }
+    }
+
+    // Create New Configuration Modal
+    function openNewConfigModal() {
+        const name = prompt("Enter a name for the new configuration:");
+        if (!name || name.trim() === '') return;
+        
+        // Generate a unique ID
+        const id = 'c' + Date.now();
+        
+        // Create with current config as template
+        const template = configurations[currentConfigId] || Object.values(configurations)[0];
+        
+        const newConfig = {
+            id: id,
+            name: name.trim(),
+            vision_model: template.vision_model,
+            speech_model: template.speech_model,
+            enable_vision: template.enable_vision,
+            frame_interval: template.frame_interval || 5
+        };
+        
+        // Save to backend
+        fetch('/configs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(newConfig)
+        })
+        .then(response => {
+            if (response.ok) {
+                return response.json();
+            }
+            throw new Error('Failed to create configuration');
+        })
+        .then(savedConfig => {
+            configurations[savedConfig.id] = savedConfig;
+            currentConfigId = savedConfig.id;
+            populateConfigDropdown();
+            addLog(`Created new configuration: ${savedConfig.name}`);
+            
+            // Open settings modal to customize the new config
+            openSettingsModal();
+        })
+        .catch(error => {
+            console.error('Error creating configuration:', error);
+            addLog(`Error creating configuration: ${error.message}`);
+        });
     }
 
     function updateConfigSummary() {
         if (!configSummary) return;
         const config = configurations[currentConfigId];
-        configSummary.textContent = `${config.vision_model} • ${config.speech_model}`;
+        if (config) {
+            configSummary.textContent = `${config.vision_model} • ${config.speech_model}`;
+        }
     }
 
     initConfigUI();
@@ -154,15 +251,52 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             dataList.innerHTML = '<div class="data-item" style="justify-content:center; color:var(--text-muted);">Loading...</div>';
             
-            // Get active embedding model to filter videos
+            // Wait for configurations to load if they haven't yet
+            if (Object.keys(configurations).length === 0) {
+                await loadConfigurations();
+            }
+            
+            // --- FIXED: Send individual model parameters instead of just ?model= ---
+            // This ensures the API computes the EXACT same config_hash as the Frontend config
             const config = configurations[currentConfigId];
-            const modelParam = config ? `?model=${encodeURIComponent(config.embedding_model)}` : '';
+            
+            if (!config) {
+                throw new Error('No configuration available');
+            }
+            
+            // Build query params from the active configuration
+            const params = new URLSearchParams();
+            params.append('vision_model', config.vision_model);
+            params.append('speech_model', config.speech_model);
+            params.append('frame_interval', config.frame_interval || 5);
+            
+            const queryString = params.toString();
+            const url = `/videos${queryString ? '?' + queryString : ''}`;
+            
+            console.log(`[fetchIngestedData] Fetching: ${url}`);
+            console.log(`[fetchIngestedData] Frontend Config: vision=${config.vision_model}, speech=${config.speech_model}`);
 
-            // Fetch videos filtered by model
-            const response = await fetch(`/videos${modelParam}`);
+            // Fetch videos filtered by model configuration
+            const response = await fetch(url);
             if (!response.ok) throw new Error('Failed to fetch videos');
             
+            // --- DEBUG: Log the backend's config hash from response headers ---
+            const backendConfigHash = response.headers.get('X-Debug-Config-Hash');
+            const backendVisionModel = response.headers.get('X-Debug-Vision-Model');
+            const backendSpeechModel = response.headers.get('X-Debug-Speech-Model');
+            
+            console.log(`[fetchIngestedData] Backend Debug Headers:`);
+            console.log(`  X-Debug-Config-Hash: ${backendConfigHash}`);
+            console.log(`  X-Debug-Vision-Model: ${backendVisionModel}`);
+            console.log(`  X-Debug-Speech-Model: ${backendSpeechModel}`);
+            console.log(`  Fixed Embedding: all-MiniLM-L6-v2`);
+            
             let videos = await response.json();
+            
+            // Log the config_hash returned by backend for debugging
+            if (videos.length > 0) {
+                console.log(`[fetchIngestedData] First video status: ${videos[0].status}, config_hash: ${videos[0].config_hash}`);
+            }
             
             // Client-side filtering for POC
             if (view === 'recent') {
@@ -198,11 +332,22 @@ document.addEventListener('DOMContentLoaded', () => {
             let statusClass = 'processing';
             let statusText = video.status || 'Unknown';
             
-            if (statusText === 'ready') {
+            // Map backend status to UI classes and user-friendly text
+            if (statusText === 'indexed') {
                 statusClass = 'success';
-                statusText = 'Indexed';
-            } else if (statusText.includes('error')) {
-                statusClass = 'error'; 
+                statusText = 'Ready';
+            } else if (statusText === 'completed') {
+                statusClass = 'processing';
+                statusText = 'Embedding...';
+            } else if (statusText === 'failed') {
+                statusClass = 'error';
+                statusText = 'Failed';
+            } else if (statusText === 'queued') {
+                statusClass = 'pending';
+                statusText = 'Queued';
+            } else if (statusText === 'processing') {
+                statusClass = 'processing';
+                statusText = 'Processing';
             }
 
             item.innerHTML = `
@@ -311,13 +456,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 statusText.textContent = 'Upload complete!';
                 statusText.style.color = 'var(--success)';
                 addLog(`Upload successful: ${result.filename}`);
-                addLog('Video queued for processing (Ingestion Agent notified).');
+                addLog('Video queued for processing. Check the status in the sidebar.');
                 
-                // Simulate processing logs
-                setTimeout(() => addLog(`Extracting audio from ${result.filename}...`), 2000);
-                setTimeout(() => addLog(`Transcribing audio...`), 4500);
-                setTimeout(() => addLog(`Generating embeddings...`), 8000);
-                setTimeout(() => addLog(`Indexing complete. Video ready for search.`), 12000);
+                // Refresh video list to show new upload
+                setTimeout(() => fetchIngestedData(), 1000);
             } else {
                 const err = await response.text();
                 throw new Error(err);
@@ -379,13 +521,27 @@ document.addEventListener('DOMContentLoaded', () => {
                 url += `&video_id=${selectedVideoId}`;
             }
 
-            // Add active embedding model from configuration
+            // Add ALL config parameters so backend computes correct hash
             const config = configurations[currentConfigId];
-            if (config && config.embedding_model) {
-                url += `&model=${encodeURIComponent(config.embedding_model)}`;
+            if (config) {
+                url += `&vision_model=${encodeURIComponent(config.vision_model)}`;
+                url += `&speech_model=${encodeURIComponent(config.speech_model)}`;
+                url += `&embedding_model=${encodeURIComponent(config.embedding_model)}`;
             }
             
+            console.log(`[Search] URL: ${url}`);
+            addLog(`Searching with config: ${config?.name || 'default'}`);
+            
             const response = await fetch(url);
+            
+            // Log debug headers
+            const debugHash = response.headers.get('X-Debug-Config-Hash');
+            const debugCollection = response.headers.get('X-Debug-Collection-Name');
+            if (debugHash) {
+                console.log(`[Search] Backend config_hash: ${debugHash}`);
+                console.log(`[Search] Collection: ${debugCollection}`);
+            }
+            
             const results = await response.json();
             
             const loadingEl = document.getElementById(loadingId);
@@ -403,26 +559,36 @@ document.addEventListener('DOMContentLoaded', () => {
             
             results.forEach(res => {
                 // Determine score badge class
-                const scorePct = res.score * 100;
+                const scorePct = (res.score || 0) * 100;
                 let badgeClass = 'score-med';
                 if (scorePct >= 80) badgeClass = 'score-high';
 
+                // Safe property access with defaults
+                const text = res.text || 'No text available';
+                const filename = res.filename || 'Unknown';
+                const startTime = res.start || 0;
+                const endTime = res.end || 0;
+                const videoId = res.video_id || '';
+                const resultType = res.type || 'unknown';
+
                 // Highlight keywords in text (simple implementation)
-                const highlightedText = res.text.replace(new RegExp(query, 'gi'), match => `<span class="highlight">${match}</span>`);
+                const highlightedText = text.replace(new RegExp(query, 'gi'), match => `<span class="highlight">${match}</span>`);
+
+                // Build video URL - use the video file directly since we don't have clip generation yet
+                // In a full implementation, this would point to a clip extraction endpoint
+                const videoUrl = videoId ? `/videos/${videoId}_${filename.replace(/ /g, '_')}` : '#';
 
                 resultHtml += `
                     <div class="video-result">
                         <div class="video-header">
-                            <span class="filename">${res.filename}</span>
+                            <span class="filename">${filename}</span>
                             <span class="score-badge ${badgeClass}">${scorePct.toFixed(0)}% Match</span>
+                            <span class="result-type">${resultType}</span>
                         </div>
                         <div class="video-body">
                             <div class="transcript-text">"${highlightedText}"</div>
-                            <div class="video-player-container">
-                                <video controls width="100%" src="${res.clip_url}"></video>
-                            </div>
                             <div class="video-footer">
-                                ${res.start_time.toFixed(1)}s - ${res.end_time.toFixed(1)}s
+                                <i class="fas fa-clock"></i> ${startTime.toFixed(1)}s - ${endTime.toFixed(1)}s
                             </div>
                         </div>
                     </div>
@@ -478,7 +644,6 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initialize card listeners
     setupCardSelection('visionOptions');
     setupCardSelection('speechOptions');
-    setupCardSelection('embeddingOptions');
 
     // Toggle Vision Section Logic
     const visionCheck = document.getElementById('enableVisionCheck');
@@ -514,7 +679,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         selectCard('visionOptions', config.vision_model);
         selectCard('speechOptions', config.speech_model);
-        selectCard('embeddingOptions', config.embedding_model);
 
         // Set Enable Vision Checkbox & Dimming State
         if (visionCheck) {
@@ -528,6 +692,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function saveConfiguration() {
         const config = configurations[currentConfigId];
+        if (!config) return;
 
         // Helper to get selected value
         const getSelectedValue = (containerId) => {
@@ -543,16 +708,38 @@ document.addEventListener('DOMContentLoaded', () => {
         const speechVal = getSelectedValue('speechOptions');
         if (speechVal) config.speech_model = speechVal;
 
-        const embedVal = getSelectedValue('embeddingOptions');
-        if (embedVal) config.embedding_model = embedVal;
-
         // Get Enable Vision Checkbox
         const visionCheck = document.getElementById('enableVisionCheck');
         if (visionCheck) config.enable_vision = visionCheck.checked;
 
-        updateConfigSummary();
-        modal.style.display = "none";
-        addLog(`Configuration '${config.name}' updated.`);
+        // Persist to backend
+        fetch(`/configs/${currentConfigId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(config)
+        })
+        .then(response => {
+            if (response.ok) {
+                return response.json();
+            }
+            throw new Error('Failed to save configuration');
+        })
+        .then(savedConfig => {
+            configurations[currentConfigId] = savedConfig;
+            updateConfigSummary();
+            modal.style.display = "none";
+            addLog(`Configuration '${config.name}' saved to server.`);
+            
+            // Refresh data list to reflect any changes
+            fetchIngestedData();
+        })
+        .catch(error => {
+            console.error('Error saving configuration:', error);
+            // Still update locally even if server save fails
+            updateConfigSummary();
+            modal.style.display = "none";
+            addLog(`Configuration updated locally (server save failed: ${error.message})`);
+        });
     }
 
     if (closeModalBtn) {

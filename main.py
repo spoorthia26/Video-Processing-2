@@ -2,117 +2,97 @@ import multiprocessing
 import time
 import sys
 import os
-import socket
+import shutil
+from pathlib import Path
 import uvicorn
-
-# Ensure the current directory is in the path so imports work
-sys.path.append(os.getcwd())
-
 from agents.common.config import settings
 
-def find_available_port(start_port, max_tries=10):
-    """
-    Finds an available port starting from start_port.
-    Returns the first available port or raises an exception if none found.
-    """
-    for port in range(start_port, start_port + max_tries):
-        # Try to bind to the port to check availability
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                # Bind to the specific host and port
-                s.bind((settings.API_HOST, port))
-                # If successful, the port is free. The socket is closed when exiting the 'with' block.
-                return port
-            except OSError:
-                # Port is in use, try the next one
-                continue
-    raise RuntimeError(f"Could not find an available port in range {start_port}-{start_port + max_tries}")
+# Ensure the current directory is in the path
+sys.path.append(os.getcwd())
 
-def start_api(port):
-    """Runs the FastAPI server on the specified port."""
-    print(f"Starting API on port {port}...")
-    # Using a string import for uvicorn is safer for multiprocessing
-    uvicorn.run("agents.api.api_service:app", host=settings.API_HOST, port=port, reload=False)
+def setup_ffmpeg():
+    """Adds local FFmpeg to PATH if not found globally."""
+    if not shutil.which("ffmpeg"):
+        # Look for local tools folder
+        ffmpeg_path = Path("tools/ffmpeg/ffmpeg-7.0-full_build/bin")
+        if ffmpeg_path.exists():
+            print(f"Found local FFmpeg at: {ffmpeg_path}")
+            os.environ["PATH"] = str(ffmpeg_path.resolve()) + os.pathsep + os.environ["PATH"]
+        else:
+            print("Warning: FFmpeg not found in PATH or tools/ directory. Ingestion may fail.")
+
+def start_api():
+    """Runs the FastAPI server."""
+    print(f"Starting API on {settings.API_HOST}:{settings.API_PORT}...")
+    uvicorn.run("main_api:app", host=settings.API_HOST, port=settings.API_PORT, reload=False)
 
 def start_ingestion():
     """Runs the Ingestion Agent."""
     print("Starting Ingestion Agent...")
-    from agents.ingestion_agent.ingestion_entry import main
-    main()
+    from agents.ingestion import process_inbox
+    while True:
+        try:
+            process_inbox()
+        except Exception as e:
+            print(f"Ingestion Error: {e}")
+        time.sleep(5)
 
-def start_transcription():
-    """Runs the Transcription Agent."""
-    print("Starting Transcription Agent...")
-    from agents.transcription_agent.transcription_entry import main
-    main()
+def start_processor():
+    """Runs the Processor Agent."""
+    print("Starting Processor Agent...")
+    from agents.processor import run_processor
+    while True:
+        try:
+            run_processor()
+        except Exception as e:
+            print(f"Processor Error: {e}")
+            time.sleep(5)
 
 def start_embedding():
     """Runs the Embedding Agent."""
     print("Starting Embedding Agent...")
-    from agents.embedding_agent.embedding_entry import main
-    main()
+    from agents.embedding import run_embedding
+    while True:
+        try:
+            run_embedding()
+        except Exception as e:
+            print(f"Embedding Error: {e}")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    # Force multiprocessing to use the current python executable (venv)
-    # This prevents subprocesses from spawning with the system python
     if sys.platform == 'win32':
         multiprocessing.set_executable(sys.executable)
 
     print(f"Running with Python: {sys.executable}")
-
-    # Initialize Database if needed
-    print("Checking database...")
-    try:
-        import setup_database
-        # We need to force the creation if it doesn't exist, setup_database.main() handles the check
-        setup_database.main()
-    except Exception as e:
-        print(f"Database initialization failed: {e}")
-        sys.exit(1)
-
-    # Find an available port for the API
-    try:
-        api_port = find_available_port(settings.API_PORT)
-        print(f"Selected available port for API: {api_port}")
-    except RuntimeError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+    
+    # Setup Environment
+    setup_ffmpeg()
 
     # Create processes
-    # Pass the discovered port to the API process
-    p_api = multiprocessing.Process(target=start_api, args=(api_port,), name="API")
+    p_api = multiprocessing.Process(target=start_api, name="API")
     p_ingest = multiprocessing.Process(target=start_ingestion, name="Ingestion")
-    p_transcribe = multiprocessing.Process(target=start_transcription, name="Transcription")
+    p_process = multiprocessing.Process(target=start_processor, name="Processor")
     p_embed = multiprocessing.Process(target=start_embedding, name="Embedding")
 
-    processes = [p_api, p_ingest, p_transcribe, p_embed]
+    processes = [p_api, p_ingest, p_process, p_embed]
 
     try:
         # Start all processes
         for p in processes:
             p.start()
-            time.sleep(1) # Stagger start slightly
+            time.sleep(1)
 
         print("\n" + "="*50)
         print(f"🚀 System is running!")
-        print(f"🌐 Open the UI at: http://localhost:{api_port}")
+        print(f"🌐 Open the UI at: http://localhost:{settings.API_PORT}")
         print("="*50 + "\n")
-        print("Press Ctrl+C to stop.")
         
-        # Monitor processes
+        # Keep main process alive
         while True:
             time.sleep(1)
-            # Check if any process has died unexpectedly
-            for p in processes:
-                if not p.is_alive():
-                    # If a process dies, we could restart it, but for now we just log it
-                    # print(f"Process {p.name} is not running.")
-                    pass
-                    
+            
     except KeyboardInterrupt:
-        print("\nStopping all agents...")
+        print("Stopping...")
         for p in processes:
-            if p.is_alive():
-                p.terminate()
-                p.join()
-        print("System stopped.")
+            p.terminate()
+            p.join()

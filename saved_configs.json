@@ -1,0 +1,36 @@
+{
+  "configurations": [
+    {
+      "id": "c1",
+      "name": "BLIP + Whisper Base (Fast)",
+      "vision_model": "Salesforce/blip-image-captioning-base",
+      "speech_model": "base",
+      "enable_vision": true,
+      "frame_interval": 5
+    },
+    {
+      "id": "c2",
+      "name": "BLIP + Whisper Large",
+      "vision_model": "Salesforce/blip-image-captioning-base",
+      "speech_model": "large-v3",
+      "enable_vision": true,
+      "frame_interval": 5
+    },
+    {
+      "id": "c3",
+      "name": "Florence-2 + Distil-Whisper",
+      "vision_model": "microsoft/Florence-2-large",
+      "speech_model": "distil-large-v3",
+      "enable_vision": true,
+      "frame_interval": 5
+    },
+    {
+      "id": "c4",
+      "name": "Qwen VL + Whisper Base",
+      "vision_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+      "speech_model": "base",
+      "enable_vision": true,
+      "frame_interval": 5
+    }
+  ]
+}

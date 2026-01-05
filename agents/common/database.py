@@ -1,64 +1,74 @@
-from contextlib import contextmanager
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, JSON, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
-from .config import settings
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
+from .config import settings, VideoStatus
 
-# Create the SQLAlchemy engine using the database URL from settings
-engine = create_engine(
-    settings.DATABASE_URL,
-    pool_pre_ping=True # Helps prevent connection errors
-)
-
-# Create a configured "Session" class. This is the factory for all new sessions.
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Create a base class for our SQLAlchemy ORM models. All models will inherit from this.
 Base = declarative_base()
 
-@contextmanager
-def get_db_session():
-    """
-    Provides a new database session for a single unit of work.
-    This function is designed to be used in a 'with' statement
-    or context manager to ensure the session is always closed.
+class Video(Base):
+    __tablename__ = "videos"
+
+    id = Column(String, primary_key=True)  # UUID
+    filename = Column(String, nullable=False)
+    file_path = Column(String, nullable=False)
+    duration = Column(Float)
+    fps = Column(Float)
+    width = Column(Integer)
+    height = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
     
-    Example:
-    with get_db_session() as db:
-        db.query(...)
-    """
+    # Relationship to processing results
+    processing_results = relationship("ProcessingResult", back_populates="video", cascade="all, delete-orphan")
+
+class ProcessingResult(Base):
+    __tablename__ = "processing_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    video_id = Column(String, ForeignKey("videos.id"), nullable=False)
+    config_hash = Column(String, nullable=False)
+    
+    # Configuration Snapshot (embedding model is fixed system-wide)
+    speech_model = Column(String, nullable=False)
+    vision_model = Column(String, nullable=False)
+    frame_interval = Column(Integer, nullable=False)
+    
+    # Status for this specific config
+    status = Column(String, default=VideoStatus.QUEUED.value)
+    error_message = Column(Text, nullable=True)
+    
+    # Artifact Paths
+    transcript_path = Column(String, nullable=True)
+    captions_path = Column(String, nullable=True)
+    
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Ensure one result per video + config
+    __table_args__ = (
+        UniqueConstraint('video_id', 'config_hash', name='uix_video_config'),
+    )
+    
+    video = relationship("Video", back_populates="processing_results")
+
+# Database Setup
+engine = create_engine(settings.DB_PATH, connect_args={"check_same_thread": False})
+
+# Enable WAL Mode for better concurrency
+from sqlalchemy import event
+@event.listens_for(engine, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.close()
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+
+def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-def get_transcript_for_video(video_id, model_name):
-    """
-    Helper function to retrieve a specific transcript version.
-    """
-    from .models import Transcript
-    with get_db_session() as db:
-        transcript = db.query(Transcript).filter(
-            Transcript.video_id == video_id,
-            Transcript.model_name == model_name
-        ).first()
-        # Detach from session so it can be used outside
-        if transcript:
-            db.expunge(transcript)
-        return transcript
-
-def get_captions_for_video(video_id, model_name):
-    """
-    Helper function to retrieve specific captions version.
-    """
-    from .models import VideoCaptions
-    with get_db_session() as db:
-        captions = db.query(VideoCaptions).filter(
-            VideoCaptions.video_id == video_id,
-            VideoCaptions.model_name == model_name
-        ).first()
-        # Detach from session so it can be used outside
-        if captions:
-            db.expunge(captions)
-        return captions
