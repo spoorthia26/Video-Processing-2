@@ -3,8 +3,11 @@ import json
 import logging
 import uuid
 import requests
+import os
 from typing import List, Dict
 from sqlalchemy.orm import Session
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
 from agents.common.config import settings, VideoStatus
 from agents.common.database import SessionLocal, Video, ProcessingResult
 from agents.common.model_factory import ModelFactory
@@ -13,8 +16,36 @@ from agents.common.model_factory import ModelFactory
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("EmbeddingAgent")
 
-# NOTE: We do NOT initialize QdrantClient here to avoid file locking issues.
-# We send vectors to the API instead.
+# ═══════════════════════════════════════════════════════════
+# FIX #4: DIRECT QDRANT CLIENT - Eliminates HTTP overhead
+# Use direct client for local operations, fall back to API if needed
+# ═══════════════════════════════════════════════════════════
+
+# Environment variable to control indexing mode
+# Set USE_DIRECT_QDRANT=true to bypass HTTP API (faster for local)
+USE_DIRECT_QDRANT = os.environ.get("USE_DIRECT_QDRANT", "true").lower() == "true"
+
+# Lazy Qdrant client for direct mode
+_direct_qdrant_client = None
+
+def get_direct_qdrant():
+    """Get or create direct Qdrant client (lazy initialization)."""
+    global _direct_qdrant_client
+    if _direct_qdrant_client is None:
+        logger.info(f"Initializing direct Qdrant client at: {settings.QDRANT_PATH}")
+        _direct_qdrant_client = QdrantClient(path=str(settings.QDRANT_PATH))
+    return _direct_qdrant_client
+
+def ensure_collection_direct(collection_name: str):
+    """Ensure collection exists using direct client."""
+    qdrant = get_direct_qdrant()
+    collections = qdrant.get_collections()
+    if not any(c.name == collection_name for c in collections.collections):
+        logger.info(f"Creating collection: {collection_name}")
+        qdrant.create_collection(
+            collection_name=collection_name,
+            vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE)
+        )
 
 def chunk_text(data: List[Dict], chunk_size: int = 30, overlap: int = 5):
     """
@@ -91,7 +122,47 @@ def index_video(result: ProcessingResult, video: Video, db: Session):
         embedding_model = ModelFactory.get_text_embedding_model(settings.FIXED_EMBEDDING_MODEL)
         embeddings = embedding_model.encode(texts)
         
-        # 4. Upload to Qdrant via API
+        collection_name = f"video_rag_{result.config_hash}"
+        
+        # ═══════════════════════════════════════════════════════════
+        # FIX #4: Direct Qdrant insertion (no HTTP overhead)
+        # Falls back to API if direct mode is disabled
+        # ═══════════════════════════════════════════════════════════
+        
+        if USE_DIRECT_QDRANT:
+            # DIRECT MODE: Insert directly into Qdrant (faster, no HTTP overhead)
+            try:
+                ensure_collection_direct(collection_name)
+                
+                points = [
+                    models.PointStruct(
+                        id=str(uuid.uuid4()),
+                        vector=embeddings[i].tolist(),
+                        payload={
+                            "video_id": video.id,
+                            "filename": video.filename,
+                            "text": chunk["text"],
+                            "start": chunk["start"],
+                            "end": chunk["end"],
+                            "type": chunk["type"],
+                            "config_hash": result.config_hash
+                        }
+                    )
+                    for i, chunk in enumerate(chunks_to_index)
+                ]
+                
+                get_direct_qdrant().upsert(collection_name=collection_name, points=points)
+                
+                result.status = VideoStatus.INDEXED.value
+                db.commit()
+                logger.info(f"[Direct] Indexed {len(points)} chunks for {video.filename} into {collection_name}")
+                return
+                
+            except Exception as e:
+                logger.warning(f"Direct Qdrant failed: {e}, falling back to API")
+                # Fall through to API mode
+        
+        # API MODE: Send via HTTP (fallback or when direct mode disabled)
         chunks_payload = []
         for i, chunk in enumerate(chunks_to_index):
             chunks_payload.append({
@@ -108,9 +179,7 @@ def index_video(result: ProcessingResult, video: Video, db: Session):
                 }
             })
             
-        # Send to API
         api_url = f"http://127.0.0.1:{settings.API_PORT}/index"
-        collection_name = f"video_rag_{result.config_hash}"
         
         try:
             response = requests.post(api_url, json={
@@ -121,7 +190,7 @@ def index_video(result: ProcessingResult, video: Video, db: Session):
             
             result.status = VideoStatus.INDEXED.value
             db.commit()
-            logger.info(f"Successfully indexed {len(chunks_payload)} chunks for {video.filename} into {collection_name}")
+            logger.info(f"[API] Indexed {len(chunks_payload)} chunks for {video.filename} into {collection_name}")
             
         except requests.exceptions.ConnectionError:
             logger.error(f"Could not connect to API at {api_url}. Is it running?")

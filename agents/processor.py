@@ -3,6 +3,9 @@ import json
 import logging
 import cv2
 import torch
+import queue
+import threading
+import gc
 from pathlib import Path
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -18,6 +21,11 @@ logger = logging.getLogger("ProcessorAgent")
 _loaded_config_hash = None
 _loaded_speech_model = None
 _loaded_vision_model = None
+
+# ═══════════════════════════════════════════════════════════
+# FIX #5: ASYNC FRAME EXTRACTION - Producer-Consumer Pattern
+# Prevents GPU starvation by prefetching frames while GPU processes
+# ═══════════════════════════════════════════════════════════
 
 def extract_frames(video_path: str, interval: int = 5):
     """Generator that yields (timestamp, frame_image) every `interval` seconds."""
@@ -45,6 +53,79 @@ def extract_frames(video_path: str, interval: int = 5):
         current_frame += frame_step
     
     cap.release()
+
+def extract_frames_async(video_path: str, interval: int = 5, buffer_size: int = 8):
+    """
+    Async frame extraction with prefetch buffer.
+    GPU can process frames while CPU extracts the next batch.
+    """
+    frame_queue = queue.Queue(maxsize=buffer_size)
+    stop_event = threading.Event()
+    error_holder = [None]  # Mutable container to capture producer errors
+    
+    def producer():
+        try:
+            cap = cv2.VideoCapture(video_path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            
+            if not fps or fps <= 0:
+                error_holder[0] = f"Could not determine FPS for {video_path}"
+                return
+            
+            frame_step = int(fps * interval)
+            current_frame = 0
+            
+            while cap.isOpened() and not stop_event.is_set():
+                cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                timestamp = current_frame / fps
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Block if queue is full (backpressure)
+                try:
+                    frame_queue.put((timestamp, frame_rgb), timeout=30)
+                except queue.Full:
+                    logger.warning("Frame queue full, consumer may be slow")
+                    break
+                    
+                current_frame += frame_step
+            
+            cap.release()
+        except Exception as e:
+            error_holder[0] = str(e)
+        finally:
+            frame_queue.put(None)  # Sentinel to signal end
+    
+    # Start producer thread
+    thread = threading.Thread(target=producer, daemon=True)
+    thread.start()
+    
+    # Consumer yields from queue
+    while True:
+        try:
+            item = frame_queue.get(timeout=60)
+            if item is None:  # Sentinel received
+                break
+            if error_holder[0]:
+                logger.error(f"Producer error: {error_holder[0]}")
+                break
+            yield item
+        except queue.Empty:
+            logger.warning("Frame queue timeout - producer may have stalled")
+            break
+    
+    stop_event.set()
+    thread.join(timeout=5)
+
+def clear_gpu_memory():
+    """Clear GPU memory after model unloading."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 def process_video(video: Video, result: ProcessingResult, db: Session):
     """
@@ -122,7 +203,10 @@ def process_video(video: Video, result: ProcessingResult, db: Session):
             model = vision_instance["model"]
             model_type = vision_instance["type"]
             
-            for timestamp, frame in extract_frames(video.file_path, interval=settings.FRAME_INTERVAL):
+            # FIX #5: Use async frame extraction to prevent GPU starvation
+            frame_generator = extract_frames_async(video.file_path, interval=result.frame_interval)
+            
+            for timestamp, frame in frame_generator:
                 # Prepare inputs based on model type
                 if model_type == "blip":
                     inputs = processor(images=frame, return_tensors="pt").to(model.device)
@@ -198,6 +282,11 @@ def run_processor():
     - Groups by config_hash to show what's pending
     - Processes jobs, loading appropriate models based on the job's stored config
     - Supports context switching between different model configurations
+    
+    **FIX #3: CONFIG-BATCHED PROCESSING (Anti-Thrashing)**
+    - If models are loaded for config X, process ALL config X jobs first
+    - Only switch configs when current config queue is empty
+    - When switching, prefer config with most queued jobs (efficiency)
     """
     global _loaded_config_hash
     
@@ -210,27 +299,51 @@ def run_processor():
             func.count(ProcessingResult.id).label('count')
         ).filter(
             ProcessingResult.status == VideoStatus.QUEUED.value
-        ).group_by(ProcessingResult.config_hash).all()
+        ).group_by(ProcessingResult.config_hash).order_by(
+            func.count(ProcessingResult.id).desc()  # Most jobs first for efficiency
+        ).all()
         
         if queued_counts:
             logger.info("=== Queued Jobs by Configuration ===")
             for config_hash, count in queued_counts:
                 logger.info(f"  Config {config_hash[:8]}...: {count} job(s)")
         
-        # 2. Find next queued result (ANY configuration, oldest first)
-        result_to_process = db.query(ProcessingResult).filter(
-            ProcessingResult.status == VideoStatus.QUEUED.value
-        ).order_by(ProcessingResult.id).first()  # FIFO order
+        # ═══════════════════════════════════════════════════════════
+        # FIX #3: CONFIG-BATCHED QUEUE - Minimize model thrashing
+        # Strategy: Sticky sessions - process all jobs for current config first
+        # ═══════════════════════════════════════════════════════════
+        
+        result_to_process = None
+        
+        # Step 1: If we have a loaded config, prioritize jobs for it (STICKY SESSION)
+        if _loaded_config_hash:
+            result_to_process = db.query(ProcessingResult).filter(
+                ProcessingResult.status == VideoStatus.QUEUED.value,
+                ProcessingResult.config_hash == _loaded_config_hash  # Prefer current config
+            ).order_by(ProcessingResult.id).first()
+            
+            if result_to_process:
+                logger.info(f"[Sticky Session] Found job for current config {_loaded_config_hash[:8]}...")
+        
+        # Step 2: No jobs for current config - find best config to switch to
+        if not result_to_process and queued_counts:
+            # Select config with most queued jobs (batch efficiency)
+            target_config = queued_counts[0][0]
+            job_count = queued_counts[0][1]
+            
+            if _loaded_config_hash and _loaded_config_hash != target_config:
+                logger.info(f"[Config Switch] No more jobs for {_loaded_config_hash[:8]}...")
+                logger.info(f"[Config Switch] Switching to config {target_config[:8]}... ({job_count} jobs queued)")
+            
+            result_to_process = db.query(ProcessingResult).filter(
+                ProcessingResult.status == VideoStatus.QUEUED.value,
+                ProcessingResult.config_hash == target_config
+            ).order_by(ProcessingResult.id).first()
         
         if result_to_process:
             video = db.query(Video).filter(Video.id == result_to_process.video_id).first()
             
             if video:
-                # Check if we need to switch model context
-                if _loaded_config_hash and _loaded_config_hash != result_to_process.config_hash:
-                    logger.info(f"[Context Switch] Switching from config {_loaded_config_hash[:8]}... to {result_to_process.config_hash[:8]}...")
-                    # Note: Models will be reloaded in process_video as needed
-                
                 _loaded_config_hash = result_to_process.config_hash
                 process_video(video, result_to_process, db)
             else:
