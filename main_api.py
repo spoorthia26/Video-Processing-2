@@ -2,10 +2,12 @@ import uvicorn
 import logging
 import shutil
 import uuid
-from fastapi import FastAPI, HTTPException, Depends, Query, UploadFile, File, Form, Response
+import os
+from fastapi import FastAPI, HTTPException, Depends, Query, UploadFile, File, Form, Response, Request, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.concurrency import run_in_threadpool  # P0 Fix: Async file operations
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional
@@ -50,6 +52,16 @@ def get_qdrant():
 def startup_event():
     init_db()
     # Qdrant client will be initialized on first use
+    
+    # P2 Fix: Pre-load embedding model to eliminate cold-start latency on first search
+    try:
+        from agents.common.model_factory import ModelFactory
+        logger.info("Pre-loading embedding model at startup...")
+        ModelFactory.get_text_embedding_model(settings.FIXED_EMBEDDING_MODEL)
+        logger.info(f"Embedding model '{settings.FIXED_EMBEDDING_MODEL}' pre-loaded successfully")
+    except Exception as e:
+        logger.warning(f"Failed to pre-load embedding model: {e}")
+        # Non-fatal; model will load on first search request
 
 def ensure_collection(collection_name: str):
     qdrant = get_qdrant()
@@ -112,9 +124,11 @@ def debug_database(db: Session = Depends(get_db)):
     queued = db.query(func.count(ProcessingResult.id)).filter(ProcessingResult.status == VideoStatus.QUEUED.value).scalar()
     processing = db.query(func.count(ProcessingResult.id)).filter(ProcessingResult.status == VideoStatus.PROCESSING.value).scalar()
     completed = db.query(func.count(ProcessingResult.id)).filter(ProcessingResult.status == VideoStatus.COMPLETED.value).scalar()
+    indexed = db.query(func.count(ProcessingResult.id)).filter(ProcessingResult.status == VideoStatus.INDEXED.value).scalar()
     
     logger.info(f"[DEBUG] DB Path: {settings.DB_PATH}")
     logger.info(f"[DEBUG] Videos: {video_count}, Results: {result_count}")
+    logger.info(f"[DEBUG] Status: queued={queued}, processing={processing}, completed={completed}, indexed={indexed}")
     
     return DebugDBResponse(
         video_count=video_count,
@@ -124,6 +138,33 @@ def debug_database(db: Session = Depends(get_db)):
         processing_jobs=processing,
         completed_jobs=completed
     )
+
+@app.get("/debug/video/{video_id}")
+def debug_video_status(video_id: str, db: Session = Depends(get_db)):
+    """Debug endpoint to check status of a specific video across all configs."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    results = db.query(ProcessingResult).filter(ProcessingResult.video_id == video_id).all()
+    
+    return {
+        "video": {
+            "id": video.id,
+            "filename": video.filename,
+            "duration": video.duration
+        },
+        "results": [
+            {
+                "config_hash": r.config_hash,
+                "status": r.status,
+                "speech_model": r.speech_model,
+                "vision_model": r.vision_model,
+                "error_message": r.error_message
+            }
+            for r in results
+        ]
+    }
 
 @app.post("/index")
 def index_chunks(request: IndexRequest):
@@ -146,64 +187,60 @@ def list_videos(
     vision_model: Optional[str] = Query(None, description="Vision model name (e.g., 'Salesforce/blip-image-captioning-base')"),
     speech_model: Optional[str] = Query(None, description="Speech model name (e.g., 'base', 'large-v3')"),
     frame_interval: int = Query(5, description="Frame extraction interval in seconds"),
+    skip: int = Query(0, description="Number of records to skip (for pagination)"),
+    limit: int = Query(20, description="Maximum number of records to return (for pagination)"),
     db: Session = Depends(get_db)
 ):
     """
-    List all videos with their processing status for the specified configuration.
+    List videos that have been explicitly processed for the specified configuration.
     
-    **Simplified:** Embedding model is fixed system-wide to simplify configuration switching.
-    Config hash only depends on: speech_model + vision_model + frame_interval
+    **Strict Filtering:** Only returns videos with explicit ProcessingResult records 
+    matching the selected configuration. No auto-creation of queued jobs.
     
-    **Lazy Init:** If a video doesn't have a ProcessingResult for this config, one is created
-    with status='queued' so it appears as "Pending" in the UI immediately.
+    **P0 Fix:** Uses a single JOIN query for optimal performance.
+    **P1 Fix:** Supports pagination via skip/limit parameters.
+    
+    Config hash depends on: speech_model + vision_model + frame_interval
     """
     # Determine target config hash
     if vision_model and speech_model:
         # Compute hash from Frontend-provided parameters (ensures exact match)
         target_config = Settings._compute_config_hash(speech_model, vision_model, frame_interval)
-        logger.info(f"[GET /videos] Using Frontend config: vision={vision_model}, speech={speech_model}")
-        logger.info(f"[GET /videos] Computed config_hash: {target_config}")
+        logger.debug(f"[GET /videos] Using Frontend config: vision={vision_model}, speech={speech_model}, frame_interval={frame_interval}")
+        logger.debug(f"[GET /videos] Computed config_hash: {target_config}")
     else:
         # Fallback to active .env configuration
         target_config = settings.get_config_hash()
         vision_model = str(settings.ACTIVE_VISION_MODEL.value)
         speech_model = str(settings.ACTIVE_SPEECH_MODEL.value)
         frame_interval = settings.FRAME_INTERVAL
-        logger.info(f"[GET /videos] Using default .env config_hash: {target_config}")
+        logger.debug(f"[GET /videos] Using default .env config_hash: {target_config}")
+    
+    # Strict filtering: Query ProcessingResult first, filter by config_hash, then join Video
+    # This ensures we only return videos that have explicit ProcessingResult records
+    total_count = db.query(func.count(ProcessingResult.id)).filter(
+        ProcessingResult.config_hash == target_config
+    ).scalar()
     
     # Add debug headers so frontend can verify hash synchronization
     response.headers["X-Debug-Config-Hash"] = target_config
     response.headers["X-Debug-Vision-Model"] = vision_model
     response.headers["X-Debug-Speech-Model"] = speech_model
     response.headers["X-Debug-Embedding-Model"] = settings.FIXED_EMBEDDING_MODEL
-    response.headers["Access-Control-Expose-Headers"] = "X-Debug-Config-Hash, X-Debug-Vision-Model, X-Debug-Speech-Model, X-Debug-Embedding-Model"
+    response.headers["X-Total-Count"] = str(total_count)
+    response.headers["Access-Control-Expose-Headers"] = "X-Debug-Config-Hash, X-Debug-Vision-Model, X-Debug-Speech-Model, X-Debug-Embedding-Model, X-Total-Count"
     
-    # Query all videos
-    videos = db.query(Video).order_by(Video.created_at.desc()).all()
+    # Strict filtering: Only return videos with explicit ProcessingResult for this config
+    # Query ProcessingResult first and join with Video to get metadata
+    results = db.query(ProcessingResult, Video).join(
+        Video,
+        Video.id == ProcessingResult.video_id
+    ).filter(
+        ProcessingResult.config_hash == target_config
+    ).order_by(ProcessingResult.updated_at.desc()).offset(skip).limit(limit).all()
     
     video_responses = []
-    for video in videos:
-        # Check if ProcessingResult exists for this video + config
-        result = db.query(ProcessingResult).filter(
-            ProcessingResult.video_id == video.id,
-            ProcessingResult.config_hash == target_config
-        ).first()
-        
-        # --- LAZY INIT: Create queued entry if missing ---
-        if not result:
-            logger.info(f"[LAZY INIT] Creating queued ProcessingResult for video={video.id}, config={target_config}")
-            result = ProcessingResult(
-                video_id=video.id,
-                config_hash=target_config,
-                speech_model=speech_model,
-                vision_model=vision_model,
-                frame_interval=frame_interval,
-                status=VideoStatus.QUEUED.value
-            )
-            db.add(result)
-            db.commit()
-            db.refresh(result)
-        
+    for result, video in results:
         # Log the actual status being returned for debugging
         logger.debug(f"[GET /videos] Video {video.id[:8]}... status={result.status} for hash={target_config[:8]}...")
         
@@ -231,64 +268,70 @@ def search(
     if not q:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
     
-    # Compute config hash from parameters (same logic as /videos)
-    if config_hash:
-        target_config = config_hash
-    elif vision_model and speech_model:
-        target_config = Settings._compute_config_hash(speech_model, vision_model, frame_interval)
-    else:
-        target_config = settings.get_config_hash()
-    
-    collection_name = f"video_rag_{target_config}"
-    
-    # Add debug headers
-    response.headers["X-Debug-Config-Hash"] = target_config
-    response.headers["X-Debug-Collection-Name"] = collection_name
-    response.headers["Access-Control-Expose-Headers"] = "X-Debug-Config-Hash, X-Debug-Collection-Name"
-    
-    logger.info(f"[SEARCH] Query: '{q}' | Collection: {collection_name}")
-    
-    # Check if collection exists
-    qdrant = get_qdrant()
-    collections = qdrant.get_collections()
-    collection_names = [c.name for c in collections.collections]
-    logger.info(f"[SEARCH] Available collections: {collection_names}")
-    
-    if collection_name not in collection_names:
-        logger.warning(f"[SEARCH] Collection {collection_name} not found!")
-        return []
-
-    # Use fixed embedding model (simplified architecture)
-    target_embedding_model = settings.FIXED_EMBEDDING_MODEL
-    logger.info(f"[SEARCH] Using fixed embedding model: {target_embedding_model}")
-    
-    # Lazy import ModelFactory to avoid slow startup from ML libraries
-    from agents.common.model_factory import ModelFactory
-    embed_model = ModelFactory.get_text_embedding_model(target_embedding_model)
-    query_vector = embed_model.encode([q])[0].tolist()
-    
-    hits = qdrant.search(
-        collection_name=collection_name,
-        query_vector=query_vector,
-        limit=limit
-    )
-    
-    logger.info(f"[SEARCH] Found {len(hits)} results")
-    
-    results = []
-    for hit in hits:
-        payload = hit.payload
-        results.append(SearchResult(
-            video_id=payload.get("video_id"),
-            filename=payload.get("filename"),
-            text=payload.get("text"),
-            start=payload.get("start"),
-            end=payload.get("end"),
-            score=hit.score,
-            type=payload.get("type")
-        ))
+    try:
+        # Compute config hash from parameters (same logic as /videos)
+        if config_hash:
+            target_config = config_hash
+        elif vision_model and speech_model:
+            target_config = Settings._compute_config_hash(speech_model, vision_model, frame_interval)
+        else:
+            target_config = settings.get_config_hash()
         
-    return results
+        collection_name = f"video_rag_{target_config}"
+        
+        # Add debug headers
+        response.headers["X-Debug-Config-Hash"] = target_config
+        response.headers["X-Debug-Collection-Name"] = collection_name
+        response.headers["Access-Control-Expose-Headers"] = "X-Debug-Config-Hash, X-Debug-Collection-Name"
+        
+        logger.info(f"[SEARCH] Query: '{q}' | Collection: {collection_name}")
+        
+        # Check if collection exists
+        qdrant = get_qdrant()
+        collections = qdrant.get_collections()
+        collection_names = [c.name for c in collections.collections]
+        logger.info(f"[SEARCH] Available collections: {collection_names}")
+        
+        if collection_name not in collection_names:
+            logger.warning(f"[SEARCH] Collection {collection_name} not found! Videos may not be indexed yet.")
+            return []
+
+        # Use fixed embedding model (simplified architecture)
+        target_embedding_model = settings.FIXED_EMBEDDING_MODEL
+        logger.info(f"[SEARCH] Using fixed embedding model: {target_embedding_model}")
+        
+        # Lazy import ModelFactory to avoid slow startup from ML libraries
+        from agents.common.model_factory import ModelFactory
+        embed_model = ModelFactory.get_text_embedding_model(target_embedding_model)
+        query_vector = embed_model.encode([q])[0].tolist()
+        
+        hits = qdrant.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            limit=limit
+        )
+        
+        logger.info(f"[SEARCH] Found {len(hits)} results")
+        
+        results = []
+        for hit in hits:
+            payload = hit.payload
+            results.append(SearchResult(
+                video_id=payload.get("video_id"),
+                filename=payload.get("filename"),
+                text=payload.get("text"),
+                start=payload.get("start"),
+                end=payload.get("end"),
+                score=hit.score,
+                type=payload.get("type")
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.error(f"[SEARCH] Error during search: {str(e)}")
+        logger.exception(e)
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 @app.get("/debug/qdrant")
 def debug_qdrant():
@@ -504,8 +547,13 @@ async def upload_video(
         safe_filename = file.filename.replace(" ", "_")
         file_path = settings.STORAGE_DIR / f"{video_id}_{safe_filename}"
         
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # P0 Fix: Offload blocking file I/O to thread pool to prevent event loop freeze
+        # This allows the API to remain responsive during large file uploads
+        def save_file_blocking():
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+        
+        await run_in_threadpool(save_file_blocking)
         
         logger.info(f"[UPLOAD] Saved file: {file_path}")
         
@@ -541,8 +589,13 @@ async def upload_video(
                 config_data = json.loads(config)
                 vision_model = config_data.get('vision_model', str(settings.ACTIVE_VISION_MODEL.value))
                 speech_model = config_data.get('speech_model', str(settings.ACTIVE_SPEECH_MODEL.value))
+                frame_interval = config_data.get('frame_interval', settings.FRAME_INTERVAL)
                 
-                config_hash = Settings._compute_config_hash(speech_model, vision_model, settings.FRAME_INTERVAL)
+                # Use the frame_interval from config to ensure hash matches frontend
+                config_hash = Settings._compute_config_hash(speech_model, vision_model, frame_interval)
+                
+                logger.info(f"[UPLOAD] Config received: vision={vision_model}, speech={speech_model}, frame_interval={frame_interval}")
+                logger.info(f"[UPLOAD] Computed config_hash: {config_hash}")
                 
                 # Create ProcessingResult for this config
                 result = ProcessingResult(
@@ -550,7 +603,7 @@ async def upload_video(
                     config_hash=config_hash,
                     speech_model=speech_model,
                     vision_model=vision_model,
-                    frame_interval=settings.FRAME_INTERVAL,
+                    frame_interval=frame_interval,
                     status=VideoStatus.QUEUED.value
                 )
                 db.add(result)
@@ -570,6 +623,117 @@ async def upload_video(
     except Exception as e:
         logger.error(f"[UPLOAD] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Video Streaming Endpoint with Range Support ---
+@app.get("/stream/{video_id}")
+async def stream_video(
+    video_id: str,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Stream video file with HTTP Range support for seeking.
+    This enables the video player to jump to specific timestamps.
+    """
+    # Find video in database
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    video_path = Path(video.file_path)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+    
+    file_size = video_path.stat().st_size
+    
+    # Determine content type based on extension
+    extension = video_path.suffix.lower()
+    content_type_map = {
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+        '.mkv': 'video/x-matroska',
+        '.avi': 'video/x-msvideo',
+        '.mov': 'video/quicktime',
+    }
+    content_type = content_type_map.get(extension, 'video/mp4')
+    
+    # Handle Range header for seeking
+    range_header = request.headers.get('range')
+    
+    if range_header:
+        # Parse range header: "bytes=start-end"
+        range_match = range_header.replace('bytes=', '').split('-')
+        start = int(range_match[0]) if range_match[0] else 0
+        end = int(range_match[1]) if range_match[1] else file_size - 1
+        
+        # Ensure valid range
+        if start >= file_size:
+            raise HTTPException(status_code=416, detail="Range not satisfiable")
+        
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+        
+        def iterfile():
+            with open(video_path, 'rb') as f:
+                f.seek(start)
+                remaining = content_length
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while remaining > 0:
+                    read_size = min(chunk_size, remaining)
+                    data = f.read(read_size)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+        
+        return StreamingResponse(
+            iterfile(),
+            status_code=206,  # Partial Content
+            media_type=content_type,
+            headers={
+                'Content-Range': f'bytes {start}-{end}/{file_size}',
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(content_length),
+                'Content-Disposition': f'inline; filename="{video.filename}"',
+            }
+        )
+    else:
+        # No range header - return full file
+        def iterfile():
+            with open(video_path, 'rb') as f:
+                chunk_size = 1024 * 1024  # 1MB chunks
+                while True:
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    yield data
+        
+        return StreamingResponse(
+            iterfile(),
+            media_type=content_type,
+            headers={
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(file_size),
+                'Content-Disposition': f'inline; filename="{video.filename}"',
+            }
+        )
+
+@app.get("/video-info/{video_id}")
+def get_video_info(video_id: str, db: Session = Depends(get_db)):
+    """Get video metadata for the player."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    return {
+        "id": video.id,
+        "filename": video.filename,
+        "duration": video.duration,
+        "width": video.width,
+        "height": video.height,
+        "fps": video.fps,
+        "stream_url": f"/stream/{video.id}"
+    }
 
 # Mount Static Files (Frontend & Video Storage)
 # Mount videos so the frontend can play them

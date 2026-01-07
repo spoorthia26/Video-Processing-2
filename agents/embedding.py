@@ -16,14 +16,11 @@ from agents.common.model_factory import ModelFactory
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("EmbeddingAgent")
 
-# ═══════════════════════════════════════════════════════════
-# FIX #4: DIRECT QDRANT CLIENT - Eliminates HTTP overhead
-# Use direct client for local operations, fall back to API if needed
-# ═══════════════════════════════════════════════════════════
 
 # Environment variable to control indexing mode
 # Set USE_DIRECT_QDRANT=true to bypass HTTP API (faster for local)
-USE_DIRECT_QDRANT = os.environ.get("USE_DIRECT_QDRANT", "true").lower() == "true"
+# DISABLED by default to prevent concurrent access issues
+USE_DIRECT_QDRANT = os.environ.get("USE_DIRECT_QDRANT", "false").lower() == "true"
 
 # Lazy Qdrant client for direct mode
 _direct_qdrant_client = None

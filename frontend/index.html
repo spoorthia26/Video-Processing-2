@@ -47,6 +47,16 @@
                 <div id="ingestedDataList" class="data-list">
                     <!-- Populated by JS -->
                 </div>
+                <!-- P1 Fix: Pagination Controls -->
+                <div id="paginationControls" class="pagination-controls" style="display: none;">
+                    <button id="prevPageBtn" class="pagination-btn" disabled>
+                        <i class="fas fa-chevron-left"></i>
+                    </button>
+                    <span class="page-info">Page 1 of 1</span>
+                    <button id="nextPageBtn" class="pagination-btn">
+                        <i class="fas fa-chevron-right"></i>
+                    </button>
+                </div>
             </div>
 
             <div class="sidebar-section logs-section">
@@ -171,6 +181,41 @@
             <div class="modal-footer">
                 <button id="cancelConfigBtn" class="btn-secondary">Cancel</button>
                 <button id="saveConfigBtn" class="btn-primary">Save Configuration</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Video Player Modal -->
+    <div id="videoPlayerModal" class="modal">
+        <div class="modal-content video-modal-content">
+            <div class="modal-header">
+                <div class="modal-title-group">
+                    <h2 id="videoPlayerTitle">Video Player</h2>
+                    <p class="modal-description" id="videoPlayerSubtitle">Playing clip</p>
+                </div>
+                <button class="close-modal-btn" id="closeVideoPlayer"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body video-modal-body">
+                <video id="videoPlayer" controls>
+                    Your browser does not support the video tag.
+                </video>
+                <div class="video-controls-custom">
+                    <div class="clip-info">
+                        <span id="clipTimeRange"></span>
+                    </div>
+                    <div class="clip-actions">
+                        <button id="replayClipBtn" class="btn-icon" title="Replay Clip">
+                            <i class="fas fa-redo"></i> Replay Clip
+                        </button>
+                        <button id="playFullVideoBtn" class="btn-icon" title="Play Full Video">
+                            <i class="fas fa-film"></i> Full Video
+                        </button>
+                    </div>
+                </div>
+                <div class="matched-text-section">
+                    <div class="matched-text-label">Matched Content:</div>
+                    <div id="matchedTextContent" class="matched-text-content"></div>
+                </div>
             </div>
         </div>
     </div>

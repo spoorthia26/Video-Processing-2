@@ -28,29 +28,46 @@ _loaded_vision_model = None
 # ═══════════════════════════════════════════════════════════
 
 def extract_frames(video_path: str, interval: int = 5):
-    """Generator that yields (timestamp, frame_image) every `interval` seconds."""
+    """
+    Generator that yields (timestamp, frame_image) every `interval` seconds.
+    OPTIMIZED: Uses sequential reading instead of seeking for better performance.
+    """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     
     if not fps or fps <= 0:
         logger.error(f"Could not determine FPS for {video_path}")
+        cap.release()
         return
 
     frame_step = int(fps * interval)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     current_frame = 0
+    frames_to_extract = []
     
-    while cap.isOpened():
-        cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+    # Pre-calculate which frames we need
+    while current_frame < total_frames:
+        frames_to_extract.append(current_frame)
+        current_frame += frame_step
+    
+    logger.info(f"Extracting {len(frames_to_extract)} frames from video (interval={interval}s)")
+    
+    # Sequential read with skip - much faster than seeking
+    frame_idx = 0
+    next_target_idx = 0
+    
+    while cap.isOpened() and next_target_idx < len(frames_to_extract):
         ret, frame = cap.read()
         if not ret:
             break
-            
-        timestamp = current_frame / fps
-        # Convert BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        yield timestamp, frame_rgb
         
-        current_frame += frame_step
+        if frame_idx == frames_to_extract[next_target_idx]:
+            timestamp = frame_idx / fps
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            yield timestamp, frame_rgb
+            next_target_idx += 1
+        
+        frame_idx += 1
     
     cap.release()
 
@@ -58,6 +75,7 @@ def extract_frames_async(video_path: str, interval: int = 5, buffer_size: int = 
     """
     Async frame extraction with prefetch buffer.
     GPU can process frames while CPU extracts the next batch.
+    OPTIMIZED: Uses sequential reading instead of seeking.
     """
     frame_queue = queue.Queue(maxsize=buffer_size)
     stop_event = threading.Event()
@@ -73,27 +91,41 @@ def extract_frames_async(video_path: str, interval: int = 5, buffer_size: int = 
                 return
             
             frame_step = int(fps * interval)
-            current_frame = 0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # Pre-calculate target frames
+            frames_to_extract = set()
+            current = 0
+            while current < total_frames:
+                frames_to_extract.add(current)
+                current += frame_step
+            
+            logger.info(f"[Async] Extracting {len(frames_to_extract)} frames (interval={interval}s)")
+            
+            # Sequential read - MUCH faster than seeking for compressed video
+            frame_idx = 0
+            extracted_count = 0
             
             while cap.isOpened() and not stop_event.is_set():
-                cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                timestamp = current_frame / fps
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Block if queue is full (backpressure)
-                try:
-                    frame_queue.put((timestamp, frame_rgb), timeout=30)
-                except queue.Full:
-                    logger.warning("Frame queue full, consumer may be slow")
-                    break
+                if frame_idx in frames_to_extract:
+                    timestamp = frame_idx / fps
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     
-                current_frame += frame_step
+                    try:
+                        frame_queue.put((timestamp, frame_rgb), timeout=30)
+                        extracted_count += 1
+                    except queue.Full:
+                        logger.warning("Frame queue full, consumer may be slow")
+                        break
+                
+                frame_idx += 1
             
             cap.release()
+            logger.info(f"[Async] Extracted {extracted_count} frames")
         except Exception as e:
             error_holder[0] = str(e)
         finally:
@@ -165,7 +197,14 @@ def process_video(video: Video, result: ProcessingResult, db: Session):
                 _loaded_speech_model = result.speech_model
             
             speech_model = ModelFactory.get_speech_model(result.speech_model)
-            segments, _ = speech_model.transcribe(video.file_path, beam_size=5)
+            
+            # OPTIMIZATION: Use VAD filter and larger chunks for faster transcription
+            segments, _ = speech_model.transcribe(
+                video.file_path, 
+                beam_size=5,
+                vad_filter=True,  # Skip silent parts
+                vad_parameters=dict(min_silence_duration_ms=500),
+            )
             
             for segment in segments:
                 transcript_data.append({
@@ -206,44 +245,84 @@ def process_video(video: Video, result: ProcessingResult, db: Session):
             # FIX #5: Use async frame extraction to prevent GPU starvation
             frame_generator = extract_frames_async(video.file_path, interval=result.frame_interval)
             
-            for timestamp, frame in frame_generator:
-                # Prepare inputs based on model type
-                if model_type == "blip":
-                    inputs = processor(images=frame, return_tensors="pt").to(model.device)
-                    out = model.generate(**inputs)
-                    caption = processor.decode(out[0], skip_special_tokens=True)
-                elif model_type == "florence":
-                    # Florence-2 specific prompt
-                    prompt = "<MORE_DETAILED_CAPTION>"
-                    inputs = processor(text=prompt, images=frame, return_tensors="pt").to(model.device)
-                    generated_ids = model.generate(
-                        input_ids=inputs["input_ids"],
-                        pixel_values=inputs["pixel_values"],
-                        max_new_tokens=1024,
-                        do_sample=False,
-                        num_beams=3,
-                    )
-                    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-                    parsed_answer = processor.post_process_generation(generated_text, task=prompt, image_size=(frame.shape[1], frame.shape[0]))
-                    caption = parsed_answer[prompt]
-                elif model_type == "qwen":
-                    # Simplified Qwen inference
-                    text = "Describe this video frame."
-                    messages = [
-                        {"role": "user", "content": [{"type": "image", "image": frame}, {"type": "text", "text": text}]}
-                    ]
-                    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                    inputs = processor(text=[text], images=[frame], padding=True, return_tensors="pt").to(model.device)
-                    generated_ids = model.generate(**inputs, max_new_tokens=128)
-                    caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-                else:
-                    caption = "Model not supported"
+            # OPTIMIZATION: Batch processing for BLIP model (significant speedup)
+            if model_type == "blip":
+                # Collect frames in batches for efficient GPU utilization
+                BATCH_SIZE = 4  # Process 4 frames at once
+                batch_frames = []
+                batch_timestamps = []
+                
+                for timestamp, frame in frame_generator:
+                    batch_frames.append(frame)
+                    batch_timestamps.append(timestamp)
+                    
+                    if len(batch_frames) >= BATCH_SIZE:
+                        # Process batch
+                        inputs = processor(images=batch_frames, return_tensors="pt", padding=True).to(model.device)
+                        with torch.no_grad():
+                            outputs = model.generate(**inputs, max_new_tokens=50)
+                        captions = processor.batch_decode(outputs, skip_special_tokens=True)
+                        
+                        for ts, cap in zip(batch_timestamps, captions):
+                            captions_data.append({
+                                "timestamp": ts,
+                                "caption": cap,
+                                "type": "visual"
+                            })
+                        
+                        batch_frames = []
+                        batch_timestamps = []
+                
+                # Process remaining frames
+                if batch_frames:
+                    inputs = processor(images=batch_frames, return_tensors="pt", padding=True).to(model.device)
+                    with torch.no_grad():
+                        outputs = model.generate(**inputs, max_new_tokens=50)
+                    captions = processor.batch_decode(outputs, skip_special_tokens=True)
+                    
+                    for ts, cap in zip(batch_timestamps, captions):
+                        captions_data.append({
+                            "timestamp": ts,
+                            "caption": cap,
+                            "type": "visual"
+                        })
+            else:
+                # Non-batched processing for other model types
+                for timestamp, frame in frame_generator:
+                    if model_type == "florence":
+                        # Florence-2 specific prompt
+                        prompt = "<MORE_DETAILED_CAPTION>"
+                        inputs = processor(text=prompt, images=frame, return_tensors="pt").to(model.device)
+                        with torch.no_grad():
+                            generated_ids = model.generate(
+                                input_ids=inputs["input_ids"],
+                                pixel_values=inputs["pixel_values"],
+                                max_new_tokens=1024,
+                                do_sample=False,
+                                num_beams=3,
+                            )
+                        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+                        parsed_answer = processor.post_process_generation(generated_text, task=prompt, image_size=(frame.shape[1], frame.shape[0]))
+                        caption = parsed_answer[prompt]
+                    elif model_type == "qwen":
+                        # Simplified Qwen inference
+                        text = "Describe this video frame."
+                        messages = [
+                            {"role": "user", "content": [{"type": "image", "image": frame}, {"type": "text", "text": text}]}
+                        ]
+                        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = processor(text=[text], images=[frame], padding=True, return_tensors="pt").to(model.device)
+                        with torch.no_grad():
+                            generated_ids = model.generate(**inputs, max_new_tokens=128)
+                        caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    else:
+                        caption = "Model not supported"
 
-                captions_data.append({
-                    "timestamp": timestamp,
-                    "caption": caption,
-                    "type": "visual"
-                })
+                    captions_data.append({
+                        "timestamp": timestamp,
+                        "caption": caption,
+                        "type": "visual"
+                    })
             
         # --- 3. Save Results ---
         full_result = {

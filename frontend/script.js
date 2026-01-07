@@ -140,8 +140,9 @@ document.addEventListener('DOMContentLoaded', () => {
             updateConfigSummary();
             addLog(`Switched to ${configurations[currentConfigId].name}`);
             
-            // Refresh data list to simulate context switch
-            fetchIngestedData(); 
+            // Refresh data list to simulate context switch (reset to page 1)
+            currentPage = 0;
+            fetchIngestedData('all', true); 
         });
 
         if (editConfigBtn) {
@@ -247,8 +248,18 @@ document.addEventListener('DOMContentLoaded', () => {
     const dataTabs = document.querySelectorAll('.data-tab');
     const dataList = document.getElementById('ingestedDataList');
 
-    async function fetchIngestedData(view = 'all') {
+    // P1 Fix: Pagination state management
+    let currentPage = 0;
+    const pageSize = 20;
+    let totalVideoCount = 0;
+
+    async function fetchIngestedData(view = 'all', resetPage = false) {
         try {
+            // Reset pagination when switching views or configs
+            if (resetPage) {
+                currentPage = 0;
+            }
+            
             dataList.innerHTML = '<div class="data-item" style="justify-content:center; color:var(--text-muted);">Loading...</div>';
             
             // Wait for configurations to load if they haven't yet
@@ -270,10 +281,15 @@ document.addEventListener('DOMContentLoaded', () => {
             params.append('speech_model', config.speech_model);
             params.append('frame_interval', config.frame_interval || 5);
             
+            // P1 Fix: Add pagination parameters
+            const skip = currentPage * pageSize;
+            params.append('skip', skip);
+            params.append('limit', pageSize);
+            
             const queryString = params.toString();
             const url = `/videos${queryString ? '?' + queryString : ''}`;
             
-            console.log(`[fetchIngestedData] Fetching: ${url}`);
+            console.log(`[fetchIngestedData] Fetching: ${url} (page ${currentPage + 1})`);
             console.log(`[fetchIngestedData] Frontend Config: vision=${config.vision_model}, speech=${config.speech_model}`);
 
             // Fetch videos filtered by model configuration
@@ -285,10 +301,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const backendVisionModel = response.headers.get('X-Debug-Vision-Model');
             const backendSpeechModel = response.headers.get('X-Debug-Speech-Model');
             
+            // P1 Fix: Get total count from response header for pagination
+            totalVideoCount = parseInt(response.headers.get('X-Total-Count')) || 0;
+            
             console.log(`[fetchIngestedData] Backend Debug Headers:`);
             console.log(`  X-Debug-Config-Hash: ${backendConfigHash}`);
             console.log(`  X-Debug-Vision-Model: ${backendVisionModel}`);
             console.log(`  X-Debug-Speech-Model: ${backendSpeechModel}`);
+            console.log(`  X-Total-Count: ${totalVideoCount}`);
             console.log(`  Fixed Embedding: all-MiniLM-L6-v2`);
             
             let videos = await response.json();
@@ -308,11 +328,72 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             renderDataList(videos);
+            
+            // P1 Fix: Update pagination controls
+            updatePaginationControls();
         } catch (error) {
             console.error('Error fetching data:', error);
             dataList.innerHTML = '<div class="data-item" style="justify-content:center; color:var(--error);">Failed to load data</div>';
         }
     }
+    
+    // P1 Fix: Pagination control functions
+    function updatePaginationControls() {
+        const paginationContainer = document.getElementById('paginationControls');
+        if (!paginationContainer) return;
+        
+        const totalPages = Math.ceil(totalVideoCount / pageSize);
+        const pageInfo = paginationContainer.querySelector('.page-info');
+        const prevBtn = paginationContainer.querySelector('#prevPageBtn');
+        const nextBtn = paginationContainer.querySelector('#nextPageBtn');
+        
+        if (pageInfo) {
+            pageInfo.textContent = totalPages > 0 ? `Page ${currentPage + 1} of ${totalPages}` : 'No videos';
+        }
+        
+        if (prevBtn) {
+            prevBtn.disabled = currentPage === 0;
+        }
+        
+        if (nextBtn) {
+            nextBtn.disabled = currentPage >= totalPages - 1;
+        }
+        
+        // Show/hide pagination based on total count
+        paginationContainer.style.display = totalVideoCount > pageSize ? 'flex' : 'none';
+    }
+    
+    function goToNextPage() {
+        const totalPages = Math.ceil(totalVideoCount / pageSize);
+        if (currentPage < totalPages - 1) {
+            currentPage++;
+            const activeTab = document.querySelector('.data-tab.active');
+            const view = activeTab ? activeTab.getAttribute('data-view') : 'all';
+            fetchIngestedData(view);
+        }
+    }
+    
+    function goToPrevPage() {
+        if (currentPage > 0) {
+            currentPage--;
+            const activeTab = document.querySelector('.data-tab.active');
+            const view = activeTab ? activeTab.getAttribute('data-view') : 'all';
+            fetchIngestedData(view);
+        }
+    }
+    
+    // Initialize pagination button listeners
+    document.addEventListener('DOMContentLoaded', () => {
+        const prevBtn = document.getElementById('prevPageBtn');
+        const nextBtn = document.getElementById('nextPageBtn');
+        
+        if (prevBtn) {
+            prevBtn.addEventListener('click', goToPrevPage);
+        }
+        if (nextBtn) {
+            nextBtn.addEventListener('click', goToNextPage);
+        }
+    });
 
     function renderDataList(videos) {
         dataList.innerHTML = '';
@@ -338,7 +419,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 statusText = 'Ready';
             } else if (statusText === 'completed') {
                 statusClass = 'processing';
-                statusText = 'Embedding...';
+                statusText = 'Indexing...';  // More accurate than 'Embedding...'
             } else if (statusText === 'failed') {
                 statusClass = 'error';
                 statusText = 'Failed';
@@ -384,7 +465,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 dataTabs.forEach(t => t.classList.remove('active'));
                 tab.classList.add('active');
                 const view = tab.getAttribute('data-view');
-                fetchIngestedData(view);
+                // Reset to first page when switching tabs
+                fetchIngestedData(view, true);
             });
         });
     }
@@ -521,18 +603,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 url += `&video_id=${selectedVideoId}`;
             }
 
-            // Add ALL config parameters so backend computes correct hash
+            // Add config parameters (vision, speech, frame_interval only - embedding is fixed)
             const config = configurations[currentConfigId];
             if (config) {
                 url += `&vision_model=${encodeURIComponent(config.vision_model)}`;
                 url += `&speech_model=${encodeURIComponent(config.speech_model)}`;
-                url += `&embedding_model=${encodeURIComponent(config.embedding_model)}`;
+                url += `&frame_interval=${config.frame_interval || 5}`;
             }
             
             console.log(`[Search] URL: ${url}`);
             addLog(`Searching with config: ${config?.name || 'default'}`);
             
             const response = await fetch(url);
+            
+            // Check if response is OK before parsing
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Server error: ${response.status} - ${errorText}`);
+            }
             
             // Log debug headers
             const debugHash = response.headers.get('X-Debug-Config-Hash');
@@ -557,7 +645,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             let resultHtml = `Found ${results.length} relevant clips:<br>`;
             
-            results.forEach(res => {
+            results.forEach((res, index) => {
                 // Determine score badge class
                 const scorePct = (res.score || 0) * 100;
                 let badgeClass = 'score-med';
@@ -574,12 +662,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 // Highlight keywords in text (simple implementation)
                 const highlightedText = text.replace(new RegExp(query, 'gi'), match => `<span class="highlight">${match}</span>`);
 
-                // Build video URL - use the video file directly since we don't have clip generation yet
-                // In a full implementation, this would point to a clip extraction endpoint
-                const videoUrl = videoId ? `/videos/${videoId}_${filename.replace(/ /g, '_')}` : '#';
-
                 resultHtml += `
-                    <div class="video-result">
+                    <div class="video-result" onclick="playClip('${videoId}', ${startTime}, ${endTime}, '${filename.replace(/'/g, "\\'")}', \`${text.replace(/`/g, "\\`").replace(/\\/g, "\\\\")}\`)">
                         <div class="video-header">
                             <span class="filename">${filename}</span>
                             <span class="score-badge ${badgeClass}">${scorePct.toFixed(0)}% Match</span>
@@ -589,6 +673,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             <div class="transcript-text">"${highlightedText}"</div>
                             <div class="video-footer">
                                 <i class="fas fa-clock"></i> ${startTime.toFixed(1)}s - ${endTime.toFixed(1)}s
+                                <span class="play-hint"><i class="fas fa-play-circle"></i> Click to play</span>
                             </div>
                         </div>
                     </div>
@@ -602,7 +687,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const loadingEl = document.getElementById(loadingId);
             if (loadingEl) loadingEl.remove();
             
-            appendMessage('system', 'Sorry, an error occurred while searching.');
+            let errorMsg = 'Sorry, an error occurred while searching.';
+            if (error.message.includes('Server error')) {
+                errorMsg += ' The server returned an error. Please check if the video has been fully indexed.';
+            } else if (error.message.includes('collection')) {
+                errorMsg += ' The search index may not be ready yet. Please wait for the video to be fully indexed.';
+            }
+            
+            appendMessage('system', errorMsg);
             addLog(`Search error: ${error.message}`);
         }
     }
@@ -764,6 +856,123 @@ document.addEventListener('DOMContentLoaded', () => {
         if (event.target == modal) {
             modal.style.display = "none";
         }
+        const videoModal = document.getElementById('videoPlayerModal');
+        if (event.target == videoModal) {
+            closeVideoPlayerModal();
+        }
+    }
+
+    // --- Video Player Modal ---
+    const videoPlayerModal = document.getElementById('videoPlayerModal');
+    const videoPlayer = document.getElementById('videoPlayer');
+    const closeVideoPlayerBtn = document.getElementById('closeVideoPlayer');
+    const replayClipBtn = document.getElementById('replayClipBtn');
+    const playFullVideoBtn = document.getElementById('playFullVideoBtn');
+    const clipTimeRange = document.getElementById('clipTimeRange');
+    const matchedTextContent = document.getElementById('matchedTextContent');
+    const videoPlayerTitle = document.getElementById('videoPlayerTitle');
+    const videoPlayerSubtitle = document.getElementById('videoPlayerSubtitle');
+
+    let currentClipStart = 0;
+    let currentClipEnd = 0;
+    let clipEndCheckInterval = null;
+
+    window.playClip = function(videoId, startTime, endTime, filename, matchedText) {
+        if (!videoId) {
+            addLog('Error: No video ID provided');
+            return;
+        }
+
+        currentClipStart = startTime;
+        currentClipEnd = endTime;
+
+        // Update modal UI
+        videoPlayerTitle.textContent = filename;
+        videoPlayerSubtitle.textContent = `Clip: ${formatTime(startTime)} - ${formatTime(endTime)}`;
+        clipTimeRange.innerHTML = `<i class="fas fa-clock"></i> ${formatTime(startTime)} - ${formatTime(endTime)}`;
+        matchedTextContent.textContent = matchedText;
+
+        // Set video source with streaming endpoint
+        const streamUrl = `/stream/${videoId}`;
+        videoPlayer.src = streamUrl;
+        
+        // Show modal
+        videoPlayerModal.style.display = 'flex';
+        
+        // When video is ready, seek to start time
+        videoPlayer.onloadedmetadata = function() {
+            videoPlayer.currentTime = startTime;
+            videoPlayer.play();
+            addLog(`Playing clip from ${formatTime(startTime)} to ${formatTime(endTime)}`);
+            
+            // Start monitoring to pause at clip end
+            startClipEndMonitor(endTime);
+        };
+
+        videoPlayer.onerror = function() {
+            addLog(`Error loading video: ${videoId}`);
+            alert('Error loading video. Please try again.');
+        };
+    };
+
+    function startClipEndMonitor(endTime) {
+        // Clear any existing interval
+        if (clipEndCheckInterval) {
+            clearInterval(clipEndCheckInterval);
+        }
+        
+        // Check every 100ms if we've reached the clip end
+        clipEndCheckInterval = setInterval(() => {
+            if (videoPlayer.currentTime >= endTime) {
+                videoPlayer.pause();
+                clearInterval(clipEndCheckInterval);
+                clipEndCheckInterval = null;
+                addLog('Clip playback completed');
+            }
+        }, 100);
+    }
+
+    function closeVideoPlayerModal() {
+        videoPlayerModal.style.display = 'none';
+        videoPlayer.pause();
+        videoPlayer.src = '';
+        if (clipEndCheckInterval) {
+            clearInterval(clipEndCheckInterval);
+            clipEndCheckInterval = null;
+        }
+    }
+
+    if (closeVideoPlayerBtn) {
+        closeVideoPlayerBtn.onclick = closeVideoPlayerModal;
+    }
+
+    if (replayClipBtn) {
+        replayClipBtn.onclick = function() {
+            videoPlayer.currentTime = currentClipStart;
+            videoPlayer.play();
+            startClipEndMonitor(currentClipEnd);
+            addLog(`Replaying clip from ${formatTime(currentClipStart)}`);
+        };
+    }
+
+    if (playFullVideoBtn) {
+        playFullVideoBtn.onclick = function() {
+            // Clear clip end monitoring - let user watch full video
+            if (clipEndCheckInterval) {
+                clearInterval(clipEndCheckInterval);
+                clipEndCheckInterval = null;
+            }
+            videoPlayer.currentTime = 0;
+            videoPlayer.play();
+            videoPlayerSubtitle.textContent = 'Playing full video';
+            addLog('Playing full video');
+        };
+    }
+
+    function formatTime(seconds) {
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
     }
 
 });
