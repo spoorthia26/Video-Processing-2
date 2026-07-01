@@ -27,8 +27,8 @@ def start_api():
     uvicorn.run("main_api:app", host=settings.API_HOST, port=settings.API_PORT, reload=False)
 
 def start_ingestion():
-    """Runs the Ingestion Agent."""
-    print("Starting Ingestion Agent...")
+    """Runs the Ingestion Process."""
+    print("Starting Ingestion Process...")
     from agents.ingestion import process_inbox
     while True:
         try:
@@ -38,8 +38,8 @@ def start_ingestion():
         time.sleep(5)
 
 def start_processor():
-    """Runs the Processor Agent."""
-    print("Starting Processor Agent...")
+    """Runs the Processor Process."""
+    print("Starting Processor Process...")
     from agents.processor import run_processor
     while True:
         try:
@@ -49,8 +49,8 @@ def start_processor():
             time.sleep(5)
 
 def start_embedding():
-    """Runs the Embedding Agent."""
-    print("Starting Embedding Agent...")
+    """Runs the Embedding Process."""
+    print("Starting Embedding Process...")
     from agents.embedding import run_embedding
     while True:
         try:

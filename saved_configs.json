@@ -20,7 +20,7 @@
       "id": "c3",
       "name": "Florence-2 + Distil-Whisper",
       "vision_model": "microsoft/Florence-2-large",
-      "speech_model": "distil-large-v3",
+      "speech_model": "base",
       "enable_vision": true,
       "frame_interval": 5
     },

@@ -9,6 +9,7 @@ class VisionModel(str, Enum):
     BLIP_BASE = "Salesforce/blip-image-captioning-base"
     FLORENCE_2_LARGE = "microsoft/Florence-2-large"
     QWEN_2_5_VL = "Qwen/Qwen2.5-VL-7B-Instruct"
+    SIGLIP = "google/siglip-so400m-patch14-384"
 
 class VisualEmbeddingModel(str, Enum):
     SIGLIP = "google/siglip-so400m-patch14-384"
@@ -33,7 +34,7 @@ class VideoStatus(str, Enum):
     INDEXED = "indexed"
 
 # --- Path Safety: Use absolute path based on this file's location ---
-# This ensures all agents (Ingestion, Processor, API) use the SAME database file
+# This ensures all processes (Ingestion, Processor, API) use the SAME database file
 # regardless of which directory they are launched from.
 _CONFIG_DIR = Path(__file__).resolve().parent  # agents/common/
 _PROJECT_ROOT = _CONFIG_DIR.parent.parent       # Video Processing 2/

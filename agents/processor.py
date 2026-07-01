@@ -13,9 +13,10 @@ from agents.common.config import settings, VideoStatus, Settings
 from agents.common.database import SessionLocal, Video, ProcessingResult
 from agents.common.model_factory import ModelFactory
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ProcessorAgent")
+# Configure Logging - WARNING level to reduce noise
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("ProcessorProcess")
+logger.setLevel(logging.INFO)  # Keep processor logs visible
 
 # Track currently loaded models to enable context switching
 _loaded_config_hash = None
@@ -288,11 +289,15 @@ def process_video(video: Video, result: ProcessingResult, db: Session):
                         })
             else:
                 # Non-batched processing for other model types
+                from PIL import Image
                 for timestamp, frame in frame_generator:
+                    # Convert NumPy RGB to PIL Image for all non-BLIP models
+                    pil_frame = Image.fromarray(frame)
+                    
                     if model_type == "florence":
                         # Florence-2 specific prompt
                         prompt = "<MORE_DETAILED_CAPTION>"
-                        inputs = processor(text=prompt, images=frame, return_tensors="pt").to(model.device)
+                        inputs = processor(text=prompt, images=pil_frame, return_tensors="pt").to(model.device)
                         with torch.no_grad():
                             generated_ids = model.generate(
                                 input_ids=inputs["input_ids"],
@@ -302,19 +307,34 @@ def process_video(video: Video, result: ProcessingResult, db: Session):
                                 num_beams=3,
                             )
                         generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-                        parsed_answer = processor.post_process_generation(generated_text, task=prompt, image_size=(frame.shape[1], frame.shape[0]))
+                        parsed_answer = processor.post_process_generation(generated_text, task=prompt, image_size=pil_frame.size)
                         caption = parsed_answer[prompt]
                     elif model_type == "qwen":
-                        # Simplified Qwen inference
+                        # Qwen 2.5 VL inference with PIL image
                         text = "Describe this video frame."
                         messages = [
-                            {"role": "user", "content": [{"type": "image", "image": frame}, {"type": "text", "text": text}]}
+                            {"role": "user", "content": [{"type": "image", "image": pil_frame}, {"type": "text", "text": text}]}
                         ]
-                        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                        inputs = processor(text=[text], images=[frame], padding=True, return_tensors="pt").to(model.device)
+                        text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = processor(text=[text_prompt], images=[pil_frame], padding=True, return_tensors="pt").to(model.device)
                         with torch.no_grad():
                             generated_ids = model.generate(**inputs, max_new_tokens=128)
                         caption = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                    elif model_type == "siglip":
+                        # SigLIP zero-shot classification with scene labels
+                        labels = [
+                            "a person talking", "a person walking", "people having a conversation",
+                            "indoor scene", "outdoor scene", "a group of people",
+                            "close-up of a face", "landscape view", "objects on a table",
+                            "a room interior", "text or writing", "action or movement"
+                        ]
+                        inputs = processor(text=labels, images=pil_frame, return_tensors="pt", padding=True).to(model.device)
+                        with torch.no_grad():
+                            outputs = model(**inputs)
+                            logits_per_image = outputs.logits_per_image
+                            probs = logits_per_image.softmax(dim=1)
+                        top_idx = probs[0].argmax().item()
+                        caption = labels[top_idx]
                     else:
                         caption = "Model not supported"
 
@@ -442,7 +462,7 @@ def run_processor():
         db.close()
 
 if __name__ == "__main__":
-    logger.info("Starting Processor Agent (Multi-Config Mode)...")
+    logger.info("Starting Processor Process (Multi-Config Mode)...")
     logger.info(f"DB Path: {settings.DB_PATH}")
     while True:
         try:

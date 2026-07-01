@@ -22,9 +22,13 @@ from agents.common.database import get_db, Video, ProcessingResult, init_db
 # Lazy import ModelFactory only when needed for search (heavy ML dependencies)
 # from agents.common.model_factory import ModelFactory
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging - WARNING level to reduce noise
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger("VideoRAG-API")
+logger.setLevel(logging.INFO)  # Keep API logger at INFO for important messages
+
+# Suppress noisy uvicorn access logs (GET /videos polling)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(title="Video RAG API")
 
@@ -168,7 +172,7 @@ def debug_video_status(video_id: str, db: Session = Depends(get_db)):
 
 @app.post("/index")
 def index_chunks(request: IndexRequest):
-    """Internal endpoint for Embedding Agent to push vectors."""
+    """Internal endpoint for Embedding Process to push vectors."""
     if not request.chunks:
         return {"status": "empty"}
     
@@ -260,6 +264,7 @@ def search(
     q: str,
     response: Response,
     limit: int = 10,
+    video_id: Optional[str] = Query(None, description="Filter results to specific video"),
     vision_model: Optional[str] = Query(None, description="Vision model"),
     speech_model: Optional[str] = Query(None, description="Speech model"),
     frame_interval: int = Query(5, description="Frame interval"),
@@ -284,7 +289,7 @@ def search(
         response.headers["X-Debug-Collection-Name"] = collection_name
         response.headers["Access-Control-Expose-Headers"] = "X-Debug-Config-Hash, X-Debug-Collection-Name"
         
-        logger.info(f"[SEARCH] Query: '{q}' | Collection: {collection_name}")
+        logger.info(f"[SEARCH] Query: '{q}' | Collection: {collection_name}" + (f" | Video filter: {video_id}" if video_id else ""))
         
         # Check if collection exists
         qdrant = get_qdrant()
@@ -305,13 +310,27 @@ def search(
         embed_model = ModelFactory.get_text_embedding_model(target_embedding_model)
         query_vector = embed_model.encode([q])[0].tolist()
         
+        # Build query filter if video_id is specified
+        query_filter = None
+        if video_id:
+            query_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="video_id",
+                        match=models.MatchValue(value=video_id)
+                    )
+                ]
+            )
+            logger.info(f"[SEARCH] Filtering results to video: {video_id}")
+        
         hits = qdrant.search(
             collection_name=collection_name,
             query_vector=query_vector,
+            query_filter=query_filter,
             limit=limit
         )
         
-        logger.info(f"[SEARCH] Found {len(hits)} results")
+        logger.info(f"[SEARCH] Found {len(hits)} results" + (f" for video {video_id}" if video_id else ""))
         
         results = []
         for hit in hits:
@@ -717,6 +736,83 @@ async def stream_video(
                 'Content-Disposition': f'inline; filename="{video.filename}"',
             }
         )
+
+# --- Video Thumbnail Endpoint ---
+@app.get("/thumbnail/{video_id}")
+async def get_thumbnail(
+    video_id: str,
+    t: float = Query(0, description="Timestamp in seconds to extract thumbnail from"),
+    db: Session = Depends(get_db)
+):
+    """
+    Extract and return a thumbnail image from the video at the specified timestamp.
+    Uses OpenCV to extract a single frame and returns it as JPEG.
+    """
+    import cv2
+    import io
+    
+    # Find video in database
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    video_path = Path(video.file_path)
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+    
+    try:
+        # Open video with OpenCV
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise HTTPException(status_code=500, detail="Could not open video file")
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30  # Default fallback
+        
+        # Calculate frame number from timestamp
+        frame_number = int(t * fps)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Ensure frame number is within bounds
+        frame_number = max(0, min(frame_number, total_frames - 1))
+        
+        # Seek to the frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret or frame is None:
+            raise HTTPException(status_code=500, detail="Could not extract frame from video")
+        
+        # Resize thumbnail for efficiency (max 320px width)
+        height, width = frame.shape[:2]
+        max_width = 320
+        if width > max_width:
+            scale = max_width / width
+            new_width = max_width
+            new_height = int(height * scale)
+            frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        
+        # Encode as JPEG
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+        _, buffer = cv2.imencode('.jpg', frame, encode_param)
+        
+        # Return as response
+        return Response(
+            content=buffer.tobytes(),
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "public, max-age=3600",  # Cache for 1 hour
+                "Content-Disposition": f'inline; filename="thumb_{video_id}_{int(t)}.jpg"'
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating thumbnail: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating thumbnail: {str(e)}")
 
 @app.get("/video-info/{video_id}")
 def get_video_info(video_id: str, db: Session = Depends(get_db)):

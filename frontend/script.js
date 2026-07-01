@@ -8,6 +8,45 @@ document.addEventListener('DOMContentLoaded', () => {
     const sendBtn = document.getElementById('searchBtn');
     const chatHistory = document.getElementById('chatHistory');
 
+    // --- Sidebar Toggle (Responsive) ---
+    const sidebarToggle = document.getElementById('sidebarToggle');
+    const sidebar = document.querySelector('.sidebar');
+    const sidebarOverlay = document.getElementById('sidebarOverlay');
+
+    function openSidebar() {
+        sidebar.classList.add('active');
+        sidebarOverlay.classList.add('active');
+        document.body.style.overflow = 'hidden'; // Prevent background scroll
+    }
+
+    function closeSidebar() {
+        sidebar.classList.remove('active');
+        sidebarOverlay.classList.remove('active');
+        document.body.style.overflow = '';
+    }
+
+    if (sidebarToggle) {
+        sidebarToggle.addEventListener('click', () => {
+            if (sidebar.classList.contains('active')) {
+                closeSidebar();
+            } else {
+                openSidebar();
+            }
+        });
+    }
+
+    if (sidebarOverlay) {
+        sidebarOverlay.addEventListener('click', closeSidebar);
+    }
+
+    // Close sidebar on escape key
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            closeSidebar();
+            closeVideoPlayerModal();
+        }
+    });
+
     // --- Theme Toggle ---
     const themeToggleBtn = document.getElementById('themeToggle');
     const themeIcon = themeToggleBtn ? themeToggleBtn.querySelector('i') : null;
@@ -446,17 +485,33 @@ document.addEventListener('DOMContentLoaded', () => {
                     selectedVideoId = null;
                     item.classList.remove('selected');
                     addLog(`Cleared video filter.`);
+                    updateSearchPlaceholder(null);
                 } else {
                     selectedVideoId = video.id;
                     // Remove selected class from others
                     document.querySelectorAll('.data-item').forEach(el => el.classList.remove('selected'));
                     item.classList.add('selected');
                     addLog(`Selected video for search: ${video.filename}`);
+                    updateSearchPlaceholder(video.filename);
                 }
             });
 
             dataList.appendChild(item);
         });
+    }
+    
+    // Update search input placeholder based on video selection
+    function updateSearchPlaceholder(filename) {
+        const searchInput = document.getElementById('searchInput');
+        if (!searchInput) return;
+        
+        if (filename) {
+            searchInput.placeholder = `Search in "${filename.substring(0, 30)}${filename.length > 30 ? '...' : ''}"`;
+            searchInput.classList.add('filtered');
+        } else {
+            searchInput.placeholder = "Describe the scene you're looking for...";
+            searchInput.classList.remove('filtered');
+        }
     }
 
     if (dataTabs) {
@@ -643,13 +698,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
             addLog(`Found ${results.length} matches.`);
 
-            let resultHtml = `Found ${results.length} relevant clips:<br>`;
+            let resultHtml = `<div class="results-header">Found ${results.length} relevant clip${results.length !== 1 ? 's' : ''}:</div>`;
             
             results.forEach((res, index) => {
                 // Determine score badge class
                 const scorePct = (res.score || 0) * 100;
-                let badgeClass = 'score-med';
-                if (scorePct >= 80) badgeClass = 'score-high';
+                let scoreClass = 'medium';
+                if (scorePct >= 80) scoreClass = 'high';
+                else if (scorePct < 50) scoreClass = 'low';
 
                 // Safe property access with defaults
                 const text = res.text || 'No text available';
@@ -659,21 +715,46 @@ document.addEventListener('DOMContentLoaded', () => {
                 const videoId = res.video_id || '';
                 const resultType = res.type || 'unknown';
 
-                // Highlight keywords in text (simple implementation)
-                const highlightedText = text.replace(new RegExp(query, 'gi'), match => `<span class="highlight">${match}</span>`);
+                // Escape text for safe HTML insertion
+                const escapedText = text.replace(/`/g, "\\`").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+                const escapedFilename = filename.replace(/'/g, "\\'");
+
+                // Highlight keywords in text
+                const highlightedText = text.replace(new RegExp(query, 'gi'), match => `<mark class="highlight">${match}</mark>`);
 
                 resultHtml += `
-                    <div class="video-result" onclick="playClip('${videoId}', ${startTime}, ${endTime}, '${filename.replace(/'/g, "\\'")}', \`${text.replace(/`/g, "\\`").replace(/\\/g, "\\\\")}\`)">
-                        <div class="video-header">
-                            <span class="filename">${filename}</span>
-                            <span class="score-badge ${badgeClass}">${scorePct.toFixed(0)}% Match</span>
-                            <span class="result-type">${resultType}</span>
+                    <div class="video-result-card" onclick="playClip('${videoId}', ${startTime}, ${endTime}, '${escapedFilename}', \`${escapedText}\`)">
+                        <div class="card-content-section">
+                            <div class="card-header">
+                                <span class="card-filename" title="${filename}">
+                                    <i class="fas fa-film"></i> ${filename}
+                                </span>
+                                <div class="card-badges">
+                                    <span class="badge badge-score ${scoreClass}">${scorePct.toFixed(0)}%</span>
+                                    <span class="badge badge-type">${resultType}</span>
+                                </div>
+                            </div>
+                            <div class="card-transcript">${highlightedText}</div>
+                            <div class="card-footer">
+                                <span class="card-timestamp">
+                                    <i class="fas fa-clock"></i>
+                                    ${formatTimeDisplay(startTime)} - ${formatTimeDisplay(endTime)}
+                                </span>
+                                <span class="card-play-hint">
+                                    <i class="fas fa-play-circle"></i> Click to play
+                                </span>
+                            </div>
                         </div>
-                        <div class="video-body">
-                            <div class="transcript-text">"${highlightedText}"</div>
-                            <div class="video-footer">
-                                <i class="fas fa-clock"></i> ${startTime.toFixed(1)}s - ${endTime.toFixed(1)}s
-                                <span class="play-hint"><i class="fas fa-play-circle"></i> Click to play</span>
+                        <div class="card-thumbnail">
+                            <img 
+                                src="/thumbnail/${videoId}?t=${startTime}" 
+                                alt="Video thumbnail at ${formatTimeDisplay(startTime)}"
+                                loading="lazy"
+                                onerror="this.parentElement.innerHTML='<div class=\\'thumbnail-placeholder\\'><i class=\\'fas fa-video\\'></i><span>${formatTimeDisplay(startTime)}</span></div>'"
+                            />
+                            <div class="thumbnail-timestamp">${formatTimeDisplay(startTime)}</div>
+                            <div class="play-overlay">
+                                <i class="fas fa-play-circle"></i>
                             </div>
                         </div>
                     </div>
@@ -876,6 +957,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let currentClipStart = 0;
     let currentClipEnd = 0;
     let clipEndCheckInterval = null;
+    let isClosingPlayer = false;  // Flag to prevent error on intentional close
 
     window.playClip = function(videoId, startTime, endTime, filename, matchedText) {
         if (!videoId) {
@@ -883,6 +965,7 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        isClosingPlayer = false;  // Reset flag when opening
         currentClipStart = startTime;
         currentClipEnd = endTime;
 
@@ -910,6 +993,8 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         videoPlayer.onerror = function() {
+            // Don't show error if we're intentionally closing the player
+            if (isClosingPlayer) return;
             addLog(`Error loading video: ${videoId}`);
             alert('Error loading video. Please try again.');
         };
@@ -933,9 +1018,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function closeVideoPlayerModal() {
+        isClosingPlayer = true;  // Set flag before clearing source
         videoPlayerModal.style.display = 'none';
         videoPlayer.pause();
-        videoPlayer.src = '';
+        videoPlayer.removeAttribute('src');  // Better than setting to empty string
+        videoPlayer.load();  // Reset the video element
         if (clipEndCheckInterval) {
             clearInterval(clipEndCheckInterval);
             clipEndCheckInterval = null;
@@ -974,5 +1061,20 @@ document.addEventListener('DOMContentLoaded', () => {
         const secs = Math.floor(seconds % 60);
         return `${mins}:${secs.toString().padStart(2, '0')}`;
     }
+
+    // Helper for display with hours if needed
+    function formatTimeDisplay(seconds) {
+        const hrs = Math.floor(seconds / 3600);
+        const mins = Math.floor((seconds % 3600) / 60);
+        const secs = Math.floor(seconds % 60);
+        
+        if (hrs > 0) {
+            return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+        }
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }
+    
+    // Make formatTimeDisplay available globally for search results
+    window.formatTimeDisplay = formatTimeDisplay;
 
 });

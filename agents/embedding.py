@@ -12,9 +12,10 @@ from agents.common.config import settings, VideoStatus
 from agents.common.database import SessionLocal, Video, ProcessingResult
 from agents.common.model_factory import ModelFactory
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("EmbeddingAgent")
+# Configure Logging - WARNING level to reduce noise
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("EmbeddingProcess")
+logger.setLevel(logging.INFO)  # Keep embedding logs visible
 
 
 # Environment variable to control indexing mode
@@ -208,7 +209,7 @@ def run_embedding():
     """
     Main embedding loop - processes ANY completed result from ANY configuration.
     This enables multi-config support where different configs can be processed
-    without requiring a restart of the embedding agent.
+    without requiring a restart of the embedding process.
     """
     db: Session = SessionLocal()
     
@@ -234,7 +235,7 @@ def run_embedding():
         db.close()
 
 if __name__ == "__main__":
-    logger.info("Starting Embedding Agent...")
+    logger.info("Starting Embedding Process...")
     while True:
         try:
             run_embedding()

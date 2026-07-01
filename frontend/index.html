@@ -8,6 +8,9 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
 <body>
+    <!-- Sidebar Overlay for Mobile -->
+    <div id="sidebarOverlay" class="sidebar-overlay"></div>
+    
     <div class="app-container">
         <!-- Sidebar -->
         <aside class="sidebar">
@@ -73,8 +76,13 @@
         <!-- Main Chat Area -->
         <main class="main-content">
             <header class="top-bar">
-                <div class="logo">
-                    <i class="fas fa-robot"></i> Video Retrieval Assistant
+                <div class="top-bar-left">
+                    <button id="sidebarToggle" class="sidebar-toggle" title="Toggle Sidebar">
+                        <i class="fas fa-bars"></i>
+                    </button>
+                    <div class="logo">
+                        <i class="fas fa-robot"></i> Video Retrieval Assistant
+                    </div>
                 </div>
                 <div class="theme-toggle">
                     <button id="themeToggle"><i class="fas fa-moon"></i></button>

@@ -1,4 +1,13 @@
 import torch
+import logging
+import warnings
+
+# Suppress noisy library logs
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", message=".*torch.classes.*")
+
 from transformers import (
     BlipProcessor, BlipForConditionalGeneration,
     AutoProcessor, AutoModelForCausalLM,
@@ -8,7 +17,6 @@ from sentence_transformers import SentenceTransformer
 from faster_whisper import WhisperModel
 from .config import settings, VisionModel, SpeechModel, TextEmbeddingModel, VisualEmbeddingModel
 from typing import Union
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -51,17 +59,27 @@ class ModelFactory:
         
         elif model_value == VisionModel.FLORENCE_2_LARGE.value:
             processor = AutoProcessor.from_pretrained(model_value, trust_remote_code=True)
-            model = AutoModelForCausalLM.from_pretrained(model_value, trust_remote_code=True).to(device)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_value, 
+                trust_remote_code=True,
+                attn_implementation="eager"  # Fix for _supports_sdpa error
+            ).to(device)
             instance = {"processor": processor, "model": model, "type": "florence"}
             
         elif model_value == VisionModel.QWEN_2_5_VL.value:
-            # Qwen requires specific handling
-            from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-            model = Qwen2VLForConditionalGeneration.from_pretrained(
+            # Qwen 2.5 VL requires specific model class
+            from transformers import Qwen2_5_VLForConditionalGeneration
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_value, torch_dtype="auto", device_map="auto"
             )
             processor = AutoProcessor.from_pretrained(model_value)
             instance = {"processor": processor, "model": model, "type": "qwen"}
+        
+        elif model_value == VisionModel.SIGLIP.value:
+            # SigLIP for zero-shot classification
+            processor = AutoProcessor.from_pretrained(model_value)
+            model = AutoModel.from_pretrained(model_value).to(device)
+            instance = {"processor": processor, "model": model, "type": "siglip"}
         
         else:
             raise ValueError(f"Unsupported Vision Model: {model_value}")
